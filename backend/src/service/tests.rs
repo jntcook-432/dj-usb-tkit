@@ -237,6 +237,7 @@ fn scan_rekordbox_db_maps_wine_drive_paths_to_linux_paths() {
     let result = service
         .scan_rekordbox_db(ScanRekordboxDbRequest {
             path: Some(master_path.to_string_lossy().to_string()),
+            relocate_roots: Vec::new(),
         })
         .expect("scan rekordbox db");
     assert_eq!(result.indexed, 1);
@@ -326,6 +327,7 @@ fn scan_rekordbox_db_imports_updates_keeps_missing_and_reports_resource_warnings
     let result = service
         .scan_rekordbox_db(ScanRekordboxDbRequest {
             path: Some(master_path.to_string_lossy().to_string()),
+            relocate_roots: Vec::new(),
         })
         .expect("scan master db");
     assert!(imported());

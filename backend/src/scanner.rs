@@ -340,7 +340,7 @@ fn infer_artist_title(path: &Path) -> (String, String) {
     ("Unknown Artist".to_string(), stem.trim().to_string())
 }
 
-fn is_audio_path(path: &Path) -> bool {
+pub(crate) fn is_audio_path(path: &Path) -> bool {
     let file_name = path
         .file_name()
         .and_then(|x| x.to_str())

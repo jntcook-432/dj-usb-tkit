@@ -2213,6 +2213,50 @@ pub struct DetectExternalRekordboxDbData {
 pub struct ScanRekordboxDbRequest {
     #[serde(default)]
     pub path: Option<String>,
+    /// Folders to search for tracks whose `FolderPath` no longer exists (files
+    /// moved to another drive or sync folder). Empty: missing tracks are skipped.
+    #[serde(default)]
+    pub relocate_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRekordboxRelocationRequest {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub relocate_roots: Vec<String>,
+}
+
+/// One moved folder: tracks under `from_prefix` were found under `to_prefix`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelocationGroup {
+    pub from_prefix: String,
+    pub to_prefix: String,
+    pub count: usize,
+}
+
+/// Dry run of the rekordbox import's relocation: nothing is written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RekordboxRelocationPlan {
+    pub master_path: String,
+    pub total: usize,
+    /// Tracks whose `FolderPath` still exists.
+    pub present: usize,
+    pub relocated: usize,
+    /// Missing tracks matching more than one file equally well; left skipped.
+    pub ambiguous: usize,
+    /// Missing tracks matching a file only by name, with a different size;
+    /// left skipped (`01 Intro.mp3` is in every album).
+    pub weak: usize,
+    pub unresolved: usize,
+    pub groups: Vec<RelocationGroup>,
+    /// Up to 200 missing paths that were not found, ambiguous or weak.
+    pub unresolved_sample: Vec<String>,
+    /// Audio files indexed under `relocate_roots`.
+    pub indexed_files: usize,
 }
 
 // ── Mixxx library import ───────────────────────────────────
@@ -2290,6 +2334,10 @@ pub struct ImportExternalPlaylistRequest {
     /// they were edited or reanalyzed in the app.
     #[serde(default)]
     pub force: bool,
+    /// rekordbox only: folders to search for tracks whose file moved (see
+    /// `ScanRekordboxDbRequest::relocate_roots`). Ignored by the Mixxx import.
+    #[serde(default)]
+    pub relocate_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

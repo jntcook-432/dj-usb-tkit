@@ -38,7 +38,7 @@ use crate::models::{
     SaveTrackAnalysisEditsData, SaveTrackAnalysisEditsRequest, SaveTrackMetadataEditsData,
     SaveTrackMetadataEditsRequest, SaveUsbTrackAnalysisEditsData, SaveUsbTrackAnalysisEditsRequest,
     SaveUsbTrackMetadataEditsData, SaveUsbTrackMetadataEditsRequest, ScanLibraryData,
-    ScanLibraryRequest, ScanMixxxDbRequest, ScanRekordboxDbRequest, SetAnalysisPausedData,
+    ScanLibraryRequest, ScanMixxxDbRequest, ScanRekordboxDbRequest, PlanRekordboxRelocationRequest, RekordboxRelocationPlan, SetAnalysisPausedData,
     SetFrontendSettingData, SetFrontendSettingRequest, SetPlaybackMetronomeRequest,
     SetUsbDeviceNameData, SetUsbDeviceNameRequest, StopPlaybackData, TrackDetail,
     TracksMetadataSummary, UpdateUsbPlayerMenuConfigData, UpdateUsbPlayerMenuConfigRequest,
@@ -84,6 +84,13 @@ impl BackendCommands {
 
     pub fn scan_rekordbox_db(&self, req: ScanRekordboxDbRequest) -> ApiResponse<ScanLibraryData> {
         wrap(self.service.scan_rekordbox_db(req))
+    }
+
+    pub fn plan_rekordbox_relocation(
+        &self,
+        req: PlanRekordboxRelocationRequest,
+    ) -> ApiResponse<RekordboxRelocationPlan> {
+        wrap(self.service.plan_rekordbox_relocation(req))
     }
 
     pub fn list_rekordbox_playlists(

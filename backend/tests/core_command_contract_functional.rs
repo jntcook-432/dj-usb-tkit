@@ -496,6 +496,7 @@ fn scan_rekordbox_db_reports_validation_error_for_missing_path() {
     let missing_path = root.path().join("does-not-exist/master.db");
     let response = backend.scan_rekordbox_db(ScanRekordboxDbRequest {
         path: Some(missing_path.to_string_lossy().to_string()),
+        relocate_roots: Vec::new(),
     });
 
     assert!(!response.ok, "missing master.db should fail");

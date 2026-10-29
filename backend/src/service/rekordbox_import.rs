@@ -16,6 +16,7 @@ use super::cues::{
     DEFAULT_HOTCUE_COLOR_ID, MAX_HOT_CUES, insert_track_cues, is_valid_color_id, track_has_cues,
 };
 
+use super::rekordbox_relocate::{Relocation, RelocationGroups, TrackRelocator, match_score};
 use super::usb_utils::external_rekordbox_db_candidates;
 use super::usb_vendor_compat::DEFAULT_MASTER_DB_KEY;
 use super::wine_paths::{translate_wine_path, wine_prefix_of};
@@ -31,7 +32,8 @@ use crate::logging::{self, Level};
 use crate::models::{
     ExternalPlaylistKind, ExternalPlaylistSummary, ImportExternalPlaylistData,
     ImportExternalPlaylistRequest, ListExternalPlaylistsData, ListExternalPlaylistsRequest,
-    ScanLibraryData, ScanRekordboxDbRequest, TrackCue, WarningEntry,
+    PlanRekordboxRelocationRequest, RekordboxRelocationPlan, ScanLibraryData,
+    ScanRekordboxDbRequest, TrackCue, WarningEntry,
 };
 use crate::scanner::is_library_audio_file;
 
@@ -90,6 +92,10 @@ struct RbTrack {
     anlz_path: Option<String>,
     image_path: Option<String>,
     genre: Option<String>,
+    /// `FileSize` in bytes, where the schema has it (confirms a relocation).
+    file_size: Option<u64>,
+    /// The `FolderPath` rekordbox has, when `file_path` was relocated.
+    relocated_from: Option<PathBuf>,
 }
 
 fn load_rekordbox_db_tracks(conn: &Connection, master_path: &Path) -> BackendResult<Vec<RbTrack>> {
@@ -102,10 +108,14 @@ fn load_rekordbox_db_tracks(conn: &Connection, master_path: &Path) -> BackendRes
     // Genre is a FK into djmdGenre; read it only where the schema has both.
     // Under Wine, FolderPath is a Windows path into the prefix's drives.
     let wine_prefix = wine_prefix_of(master_path);
-    let has_genre = table_exists(conn, "djmdGenre")
-        && crate::edb::load_table_columns(conn, "djmdContent")?
-            .iter()
-            .any(|c| c == "GenreID");
+    let content_columns = crate::edb::load_table_columns(conn, "djmdContent")?;
+    let has_genre =
+        table_exists(conn, "djmdGenre") && content_columns.iter().any(|c| c == "GenreID");
+    let size_col = if content_columns.iter().any(|c| c == "FileSize") {
+        "c.FileSize"
+    } else {
+        "NULL"
+    };
     let (genre_col, genre_join) = if has_genre {
         ("g.Name", "LEFT JOIN djmdGenre g ON g.ID = c.GenreID")
     } else {
@@ -125,7 +135,8 @@ fn load_rekordbox_db_tracks(conn: &Connection, master_path: &Path) -> BackendRes
           c.AnalysisDataPath,
           c.ImagePath,
           CAST(c.ID AS TEXT),
-          {genre_col}
+          {genre_col},
+          {size_col}
         FROM djmdContent c
         LEFT JOIN djmdArtist  ar ON ar.ID = c.ArtistID
         LEFT JOIN djmdAlbum   al ON al.ID = c.AlbumID
@@ -159,6 +170,11 @@ fn load_rekordbox_db_tracks(conn: &Connection, master_path: &Path) -> BackendRes
                     .as_deref()
                     .and_then(non_empty_db_value)
                     .map(str::to_string),
+                file_size: row
+                    .get::<_, Option<i64>>(11)?
+                    .and_then(|n| u64::try_from(n).ok())
+                    .filter(|n| *n > 0),
+                relocated_from: None,
             })
         })
         .map_err(|e| BackendError::Validation(format!("master.db row error: {e}")))?
@@ -172,6 +188,123 @@ fn load_rekordbox_db_tracks(conn: &Connection, master_path: &Path) -> BackendRes
         })
         .collect();
     Ok(tracks)
+}
+
+/// What [`relocate_missing_tracks`] did.
+#[derive(Default)]
+struct RelocationOutcome {
+    present: usize,
+    relocated: usize,
+    ambiguous: Vec<String>,
+    weak: Vec<String>,
+    unresolved: Vec<String>,
+    groups: RelocationGroups,
+    indexed_files: usize,
+}
+
+impl RelocationOutcome {
+    fn warnings(&self) -> Vec<WarningEntry> {
+        let mut warnings = Vec::new();
+        if self.relocated > 0 {
+            warnings.push(logging::log(
+                Level::Info,
+                "scan-rekordbox-db",
+                "scan.rekordbox-db.relocated",
+                format!(
+                    "{} moved track(s) found under the search folders",
+                    self.relocated
+                ),
+            ));
+        }
+        if !self.ambiguous.is_empty() {
+            warnings.push(logging::log(
+                Level::Warn,
+                "scan-rekordbox-db",
+                "scan.rekordbox-db.relocate-ambiguous",
+                format!(
+                    "{} moved track(s) match several files equally well and were skipped",
+                    self.ambiguous.len()
+                ),
+            ));
+        }
+        if !self.weak.is_empty() {
+            warnings.push(logging::log(
+                Level::Warn,
+                "scan-rekordbox-db",
+                "scan.rekordbox-db.relocate-weak",
+                format!(
+                    "{} moved track(s) match only by file name, with a different size, and were skipped",
+                    self.weak.len()
+                ),
+            ));
+        }
+        warnings
+    }
+}
+
+/// Point each track whose file is missing at its copy under `roots`. The
+/// folders are only walked when some track is missing; `None` without roots.
+/// Pass every library track: a file another track still points at is never
+/// a target, and a file several missing tracks resolve to goes to the one
+/// whose old path matches it most closely (or, on a tie, to none).
+fn relocate_missing_tracks(tracks: &mut [RbTrack], roots: &[String]) -> Option<RelocationOutcome> {
+    if roots.iter().all(|r| r.trim().is_empty()) {
+        return None;
+    }
+    let mut outcome = RelocationOutcome::default();
+    let (present, missing): (Vec<usize>, Vec<usize>) =
+        (0..tracks.len()).partition(|&i| tracks[i].file_path.exists());
+    outcome.present = present.len();
+    if missing.is_empty() {
+        return Some(outcome);
+    }
+    let claimed: HashSet<PathBuf> = present.iter().map(|&i| tracks[i].file_path.clone()).collect();
+    let relocator = TrackRelocator::index(roots);
+    outcome.indexed_files = relocator.indexed_files();
+
+    let mut found: Vec<(usize, PathBuf)> = Vec::new();
+    for &i in &missing {
+        let t = &tracks[i];
+        let old = t.file_path.to_string_lossy().into_owned();
+        match relocator.resolve(&t.file_path, t.file_size, &claimed) {
+            Relocation::Found(new) => found.push((i, new)),
+            Relocation::Ambiguous => outcome.ambiguous.push(old),
+            Relocation::Weak => outcome.weak.push(old),
+            Relocation::NotFound => outcome.unresolved.push(old),
+        }
+    }
+    // Two tracks resolving to one file are usually one song listed twice
+    // (two albums, a re-import). The closest path match keeps it; with no
+    // single closest one, none does.
+    let mut best_claim: HashMap<&Path, (usize, usize, usize)> = HashMap::new(); // score, claimant, ties
+    for (i, new) in &found {
+        let score = match_score(&tracks[*i].file_path, new);
+        best_claim
+            .entry(new.as_path())
+            .and_modify(|(top, who, ties)| {
+                if score > *top {
+                    (*top, *who, *ties) = (score, *i, 0);
+                } else if score == *top {
+                    *ties += 1;
+                }
+            })
+            .or_insert((score, *i, 0));
+    }
+    let owner: HashMap<PathBuf, Option<usize>> = best_claim
+        .into_iter()
+        .map(|(p, (_, who, ties))| (p.to_path_buf(), (ties == 0).then_some(who)))
+        .collect();
+    for (i, new) in found {
+        let t = &mut tracks[i];
+        if owner.get(&new).copied().flatten() != Some(i) {
+            outcome.ambiguous.push(t.file_path.to_string_lossy().into_owned());
+            continue;
+        }
+        outcome.groups.add(&t.file_path, &new);
+        t.relocated_from = Some(std::mem::replace(&mut t.file_path, new));
+        outcome.relocated += 1;
+    }
+    Some(outcome)
 }
 
 /// One row of `djmdPlaylist` / `djmdHistory`.
@@ -595,6 +728,20 @@ impl<'a> RekordboxTrackImporter<'a> {
             return Ok(None);
         }
 
+        // Imported before from the path rekordbox still has: move that row to
+        // the new path so its cues, edits and playlist places come along.
+        if let Some(old) = &t.relocated_from {
+            if !self.existing.contains_key(&t.file_path) {
+                if let Some(id) = self.existing.remove(old) {
+                    tx.execute(
+                        "UPDATE tracks SET file_path = ?1 WHERE id = ?2",
+                        params![t.file_path.to_string_lossy(), id],
+                    )?;
+                    self.existing.insert(t.file_path.clone(), id);
+                }
+            }
+        }
+
         let fingerprint = build_track_match_fingerprint(
             &t.title,
             &t.artist,
@@ -902,7 +1049,8 @@ impl<'a> RekordboxTrackImporter<'a> {
 impl BackendService {
     pub fn scan_rekordbox_db(&self, req: ScanRekordboxDbRequest) -> BackendResult<ScanLibraryData> {
         let (master_path, conn) = open_rekordbox_db(req.path.as_deref())?;
-        let tracks = load_rekordbox_db_tracks(&conn, &master_path)?;
+        let mut tracks = load_rekordbox_db_tracks(&conn, &master_path)?;
+        let relocation = relocate_missing_tracks(&mut tracks, &req.relocate_roots);
 
         let mut db_conn = self.db.connect()?;
         let tx = db_conn.transaction()?;
@@ -913,7 +1061,8 @@ impl BackendService {
         }
         tx.commit()?;
 
-        let warnings = importer.finish_warnings();
+        let mut warnings = importer.finish_warnings();
+        warnings.extend(relocation.iter().flat_map(RelocationOutcome::warnings));
         Ok(ScanLibraryData {
             job_id: Uuid::now_v7().to_string(),
             indexed: importer.indexed,
@@ -941,6 +1090,45 @@ impl BackendService {
         Ok(ListExternalPlaylistsData { items })
     }
 
+    /// Dry run of the import's relocation: which missing tracks the search
+    /// folders would recover. Reads only; the local library is untouched.
+    pub fn plan_rekordbox_relocation(
+        &self,
+        req: PlanRekordboxRelocationRequest,
+    ) -> BackendResult<RekordboxRelocationPlan> {
+        const SAMPLE: usize = 200;
+        if req.relocate_roots.iter().all(|r| r.trim().is_empty()) {
+            return Err(BackendError::Validation(
+                "choose at least one folder to search".to_string(),
+            ));
+        }
+        let (master_path, conn) = open_rekordbox_db(req.path.as_deref())?;
+        let mut tracks = load_rekordbox_db_tracks(&conn, &master_path)?;
+        let outcome = relocate_missing_tracks(&mut tracks, &req.relocate_roots).unwrap_or_default();
+        let ambiguous = outcome.ambiguous.len();
+        let weak = outcome.weak.len();
+        let unresolved = outcome.unresolved.len();
+        let unresolved_sample = outcome
+            .unresolved
+            .into_iter()
+            .chain(outcome.ambiguous)
+            .chain(outcome.weak)
+            .take(SAMPLE)
+            .collect();
+        Ok(RekordboxRelocationPlan {
+            master_path: master_path.to_string_lossy().into_owned(),
+            total: tracks.len(),
+            present: outcome.present,
+            relocated: outcome.relocated,
+            ambiguous,
+            weak,
+            unresolved,
+            groups: outcome.groups.into_sorted(),
+            unresolved_sample,
+            indexed_files: outcome.indexed_files,
+        })
+    }
+
     /// Import one rekordbox playlist or history session as a new local
     /// playlist, importing its tracks like the whole-library import does.
     /// Tracks the library leaves out (missing or unsupported files) are
@@ -956,7 +1144,11 @@ impl BackendService {
             .unwrap_or_else(|| "rekordbox playlist".to_string());
 
         let wanted: HashSet<&str> = entry_ids.iter().map(String::as_str).collect();
-        let tracks_by_id: HashMap<String, RbTrack> = load_rekordbox_db_tracks(&conn, &master_path)?
+        // Relocated against the whole library, so no playlist track takes a
+        // file another library track uses.
+        let mut tracks = load_rekordbox_db_tracks(&conn, &master_path)?;
+        let relocation = relocate_missing_tracks(&mut tracks, &req.relocate_roots);
+        let tracks_by_id: HashMap<String, RbTrack> = tracks
             .into_iter()
             .filter(|t| wanted.contains(t.content_id.as_str()))
             .map(|t| (t.content_id.clone(), t))
@@ -995,6 +1187,7 @@ impl BackendService {
         tx.commit()?;
 
         let mut warnings = importer.finish_warnings();
+        warnings.extend(relocation.iter().flat_map(RelocationOutcome::warnings));
         if duplicates > 0 {
             warnings.push(logging::log(
                 Level::Info,
@@ -1337,6 +1530,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Playlist,
                 id: "11".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .expect("import playlist");
         assert!(
@@ -1405,6 +1599,7 @@ mod tests {
                     kind: ExternalPlaylistKind::Playlist,
                     id: "11".to_string(),
                     force,
+                    relocate_roots: Vec::new(),
                 })
                 .expect("import")
         };
@@ -1511,6 +1706,7 @@ mod tests {
                     kind: ExternalPlaylistKind::Playlist,
                     id: "11".to_string(),
                     force,
+                    relocate_roots: Vec::new(),
                 })
                 .expect("import")
         };
@@ -1600,6 +1796,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Playlist,
                 id: "11".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .expect("import");
         let charlie_id: String = service
@@ -1676,6 +1873,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Playlist,
                 id: "11".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .expect("import playlist");
         assert_eq!(imported.name, "Friday");
@@ -1748,6 +1946,7 @@ mod tests {
                 kind: ExternalPlaylistKind::History,
                 id: "h2".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .expect("import history");
         assert_eq!(history.indexed, 0, "tracks reused from the first import");
@@ -1763,6 +1962,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Playlist,
                 id: "15".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .unwrap_err();
         assert!(err.to_string().contains("none of the 1 track(s)"), "{err}");
@@ -1787,10 +1987,207 @@ mod tests {
                         kind,
                         id: id.to_string(),
                         force: false,
+                        relocate_roots: Vec::new(),
                     })
                     .is_err(),
                 "{kind:?} {id} should not import"
             );
         }
+    }
+
+    #[test]
+    fn import_relocates_moved_tracks_found_under_the_search_folders() {
+        let rb_root = tempfile::tempdir().expect("rb root");
+        let new_root = tempfile::tempdir().expect("new root");
+        let (_service_dir, service) = test_service();
+        // rekordbox remembers the old drive; the files now live in a sync folder.
+        let media: Vec<PathBuf> = ["a.mp3", "b.flac", "c.wav"]
+            .iter()
+            .map(|n| PathBuf::from("/Volumes/Gone/DJSET/Music").join(n))
+            .collect();
+        let moved: Vec<PathBuf> = ["a.mp3", "b.flac", "c.wav"]
+            .iter()
+            .map(|n| new_root.path().join("Sync/DJSET/Music").join(n))
+            .collect();
+        std::fs::create_dir_all(moved[0].parent().unwrap()).expect("media dir");
+        for p in &moved {
+            std::fs::write(p, b"audio").expect("write media");
+        }
+        let db_path = create_rekordbox_db_with_playlists(rb_root.path(), &media);
+        let path = Some(db_path.to_string_lossy().to_string());
+        let roots = vec![new_root.path().to_string_lossy().to_string()];
+
+        let plan = service
+            .plan_rekordbox_relocation(PlanRekordboxRelocationRequest {
+                path: path.clone(),
+                relocate_roots: roots.clone(),
+            })
+            .expect("plan");
+        assert_eq!(plan.total, 4, "the deleted row is not counted");
+        assert_eq!(plan.present, 0);
+        assert_eq!(plan.relocated, 3);
+        assert_eq!(plan.unresolved, 1);
+        assert_eq!(plan.unresolved_sample, vec!["/nowhere/missing.mp3".to_string()]);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].from_prefix, "/Volumes/Gone");
+        assert_eq!(
+            plan.groups[0].to_prefix,
+            new_root.path().join("Sync").to_string_lossy()
+        );
+        let conn = service.db.connect().expect("local db");
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(count(&conn), 0, "the plan writes nothing");
+
+        let without = service
+            .scan_rekordbox_db(ScanRekordboxDbRequest {
+                path: path.clone(),
+                relocate_roots: Vec::new(),
+            })
+            .expect("scan without roots");
+        assert_eq!(without.indexed, 0, "no roots: moved tracks stay skipped");
+
+        let scanned = service
+            .scan_rekordbox_db(ScanRekordboxDbRequest {
+                path,
+                relocate_roots: roots,
+            })
+            .expect("scan with roots");
+        assert_eq!(scanned.indexed, 3);
+        assert_eq!(scanned.not_found, vec!["/nowhere/missing.mp3".to_string()]);
+        assert!(
+            scanned
+                .warnings
+                .iter()
+                .any(|w| w.code == "scan.rekordbox-db.relocated"),
+            "{:?}",
+            scanned.warnings
+        );
+        let mut stored: Vec<String> = conn
+            .prepare("SELECT file_path FROM tracks ORDER BY file_path")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        stored.sort();
+        let mut want: Vec<String> = moved.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        want.sort();
+        assert_eq!(stored, want);
+    }
+
+    #[test]
+    fn relocating_moves_a_track_imported_before_instead_of_duplicating_it() {
+        let rb_root = tempfile::tempdir().expect("rb root");
+        let old_root = tempfile::tempdir().expect("old root");
+        let new_root = tempfile::tempdir().expect("new root");
+        let (_service_dir, service) = test_service();
+        let media: Vec<PathBuf> = ["a.mp3", "b.flac", "c.wav"]
+            .iter()
+            .map(|n| old_root.path().join("DJSET").join(n))
+            .collect();
+        std::fs::create_dir_all(media[0].parent().unwrap()).expect("old dir");
+        for p in &media {
+            std::fs::write(p, b"audio").expect("write media");
+        }
+        let db_path = create_rekordbox_db_with_playlists(rb_root.path(), &media);
+        let path = Some(db_path.to_string_lossy().to_string());
+        service
+            .scan_rekordbox_db(ScanRekordboxDbRequest {
+                path: path.clone(),
+                relocate_roots: Vec::new(),
+            })
+            .expect("first import");
+        let conn = service.db.connect().expect("local db");
+        let rows = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare("SELECT id, file_path FROM tracks ORDER BY id")
+                .expect("prepare")
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .expect("query")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        let before = rows(&conn);
+        assert_eq!(before.len(), 3);
+
+        // The music folder moves; c.wav stays behind at the old path.
+        let moved_dir = new_root.path().join("Sync/DJSET");
+        std::fs::create_dir_all(&moved_dir).expect("new dir");
+        for p in &media[..2] {
+            std::fs::rename(p, moved_dir.join(p.file_name().unwrap())).expect("move");
+        }
+        // A stray copy of c.wav in the sync folder must not take its place.
+        std::fs::write(moved_dir.join("c.wav"), b"audio").expect("stray copy");
+
+        let scanned = service
+            .scan_rekordbox_db(ScanRekordboxDbRequest {
+                path,
+                relocate_roots: vec![new_root.path().to_string_lossy().to_string()],
+            })
+            .expect("relocating import");
+        assert_eq!(scanned.indexed, 0, "no duplicate rows");
+        let after = rows(&conn);
+        assert_eq!(after.len(), 3);
+        for ((id_before, path_before), (id_after, path_after)) in before.iter().zip(&after) {
+            assert_eq!(id_before, id_after, "same row, same id");
+            let name = Path::new(path_before).file_name().unwrap();
+            let want = if name == "c.wav" {
+                PathBuf::from(path_before)
+            } else {
+                moved_dir.join(name)
+            };
+            assert_eq!(Path::new(path_after), want.as_path());
+        }
+    }
+
+    fn rb_track(path: &Path) -> RbTrack {
+        RbTrack {
+            content_id: String::new(),
+            file_path: path.to_path_buf(),
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            bpm: None,
+            tonality: None,
+            duration_ms: None,
+            anlz_path: None,
+            image_path: None,
+            genre: None,
+            file_size: None,
+            relocated_from: None,
+        }
+    }
+
+    #[test]
+    fn a_file_two_tracks_resolve_to_goes_to_the_closer_match_only() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("Music/Artist/Album/01 Song.aiff");
+        std::fs::create_dir_all(file.parent().unwrap()).expect("dir");
+        std::fs::write(&file, b"audio").expect("file");
+        let roots = vec![dir.path().to_string_lossy().to_string()];
+
+        // The same song listed twice: once from its album folder, once from
+        // a dump folder with a different parent.
+        let mut tracks = vec![
+            rb_track(Path::new("/Old/Dump/01 Song.aiff")),
+            rb_track(Path::new("/Old/Artist/Album/01 Song.aiff")),
+        ];
+        tracks[0].file_size = Some(5); // name + size: a valid but weaker match
+        let outcome = relocate_missing_tracks(&mut tracks, &roots).expect("outcome");
+        assert_eq!(outcome.relocated, 1);
+        assert_eq!(outcome.ambiguous, vec!["/Old/Dump/01 Song.aiff".to_string()]);
+        assert_eq!(tracks[1].file_path, file);
+        assert_eq!(tracks[0].file_path, Path::new("/Old/Dump/01 Song.aiff"));
+
+        // Equally close claims: neither takes it.
+        let mut tied = vec![
+            rb_track(Path::new("/A/Album/01 Song.aiff")),
+            rb_track(Path::new("/B/Album/01 Song.aiff")),
+        ];
+        let outcome = relocate_missing_tracks(&mut tied, &roots).expect("outcome");
+        assert_eq!(outcome.relocated, 0);
+        assert_eq!(outcome.ambiguous.len(), 2);
     }
 }

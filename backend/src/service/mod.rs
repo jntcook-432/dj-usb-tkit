@@ -19,6 +19,7 @@ pub(crate) mod key_notation;
 mod migrations;
 mod mixxx_import;
 mod rekordbox_import;
+mod rekordbox_relocate;
 mod repair;
 pub mod update_check;
 mod usb;

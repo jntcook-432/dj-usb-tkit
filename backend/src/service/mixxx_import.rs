@@ -1779,6 +1779,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Playlist,
                 id: "3".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .expect("import playlist");
         assert_eq!(imported.name, "Warmup");
@@ -1838,6 +1839,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Crate,
                 id: "1".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .expect("import crate");
         assert_eq!(crate_import.indexed, 0);
@@ -1853,6 +1855,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Crate,
                 id: "2".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .unwrap_err();
         assert!(err.to_string().contains("none of the 1 track(s)"), "{err}");
@@ -1870,6 +1873,7 @@ mod tests {
                 kind: ExternalPlaylistKind::Playlist,
                 id: "42".to_string(),
                 force: false,
+                relocate_roots: Vec::new(),
             })
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
@@ -1925,6 +1929,7 @@ mod tests {
                     kind,
                     id: "3".to_string(),
                     force,
+                    relocate_roots: Vec::new(),
                 })
                 .expect("import")
         };
