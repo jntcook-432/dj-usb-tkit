@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "desktop/src-tauri"]
+members = ["backend", "cueos-ffi", "desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]
