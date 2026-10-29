@@ -190,6 +190,8 @@ fn cache_key_for_root(usb_root: &Path) -> String {
     }
 
     use std::hash::{Hash, Hasher};
+    // Canonical, so a symlinked path to the same mount hashes the same.
+    let usb_root = super::usb_utils::canonicalize_or_self(usb_root.to_path_buf());
     let normalized = normalize_source_root_for_matching(&usb_root.to_string_lossy());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     normalized.hash(&mut hasher);

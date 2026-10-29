@@ -30,7 +30,16 @@ pub(super) fn add_candidate_is_usb_origin(
         .or(request_usb_root)
         .unwrap_or("")
         .trim();
-    !file_path.is_empty() && !usb_root.is_empty() && browse_path_matches_root(file_path, usb_root)
+    if file_path.is_empty() || usb_root.is_empty() {
+        return false;
+    }
+    // USB track paths come back canonical, but the root hint is whatever the
+    // caller typed, which may sit behind a symlink (macOS `/var` -> `/private/var`).
+    browse_path_matches_root(file_path, usb_root)
+        || browse_path_matches_root(
+            file_path,
+            &super::usb_utils::canonicalize_or_self(PathBuf::from(usb_root)).to_string_lossy(),
+        )
 }
 
 /// Create a local playlist holding `track_ids` in order; returns its id.

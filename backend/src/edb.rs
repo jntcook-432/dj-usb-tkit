@@ -2522,7 +2522,9 @@ mod tests {
         assert_eq!(set_a.tracks.len(), 1);
         assert_eq!(set_a.tracks[0].track_number, Some(3));
         assert!(
-            std::path::Path::new(&set_a.tracks[0].file_path).starts_with(temp.path()),
+            // Resolved paths are canonical (macOS tempdirs live behind `/var` -> `/private/var`).
+            std::path::Path::new(&set_a.tracks[0].file_path)
+                .starts_with(std::fs::canonicalize(temp.path()).expect("canonical temp")),
             "default reader should resolve USB-relative media paths: {:?}",
             set_a.tracks[0]
         );

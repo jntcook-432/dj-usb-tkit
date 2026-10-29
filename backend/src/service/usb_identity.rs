@@ -47,6 +47,9 @@ fn marker_path(root: &Path) -> PathBuf {
 static NAME_CONFLICTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn root_key(root: &Path) -> String {
+    // Canonical, so the same drive reached through a symlinked path (macOS
+    // `/var` -> `/private/var`) keeps one key.
+    let root = super::usb_utils::canonicalize_or_self(root.to_path_buf());
     super::normalize_source_root_for_matching(&root.to_string_lossy())
 }
 

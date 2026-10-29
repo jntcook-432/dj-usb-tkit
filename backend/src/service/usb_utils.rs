@@ -385,7 +385,10 @@ pub(crate) fn resolve_usb_side_path(usb_root: &Path, raw: &str) -> Option<PathBu
         return Some(PathBuf::from(normalized));
     }
 
-    // Resolve relative paths under usb_root, then verify containment
+    // Resolve relative paths under the canonical root, then verify containment.
+    // Joining onto `usb_root` itself would break for a root reached through a
+    // symlink (macOS `/var` -> `/private/var`): a not-yet-existing file can't be
+    // canonicalized, so it would keep the symlinked prefix and fail the check.
     let canon_root = canonicalize_or_self(usb_root.to_path_buf());
 
     let looks_usb_relative = normalized.starts_with(USB_VENDOR_ROOT_PREFIX)
@@ -395,7 +398,7 @@ pub(crate) fn resolve_usb_side_path(usb_root: &Path, raw: &str) -> Option<PathBu
 
     if looks_usb_relative {
         let rel = normalized.trim_start_matches('/');
-        let resolved = canonicalize_or_self(usb_root.join(rel));
+        let resolved = canonicalize_or_self(canon_root.join(rel));
         if !resolved.starts_with(&canon_root) {
             return None; // path traversal attempt
         }
@@ -407,7 +410,7 @@ pub(crate) fn resolve_usb_side_path(usb_root: &Path, raw: &str) -> Option<PathBu
         return Some(canonicalize_or_self(normalized));
     }
 
-    let resolved = canonicalize_or_self(usb_root.join(&normalized));
+    let resolved = canonicalize_or_self(canon_root.join(&normalized));
     if !resolved.starts_with(&canon_root) {
         return None; // path traversal attempt
     }
@@ -1474,9 +1477,13 @@ fn seed_rb_initialized_history_shape(bytes: &mut [u8]) {
 // ── External library master.db autodetection ────────────────
 
 pub fn detect_external_rekordbox_db() -> crate::models::DetectExternalRekordboxDbData {
-    let candidates = external_rekordbox_db_candidates();
+    first_existing_rekordbox_db(&external_rekordbox_db_candidates())
+}
 
-    for candidate in &candidates {
+fn first_existing_rekordbox_db(
+    candidates: &[PathBuf],
+) -> crate::models::DetectExternalRekordboxDbData {
+    for candidate in candidates {
         if candidate.is_file() {
             return crate::models::DetectExternalRekordboxDbData {
                 found: true,
@@ -2088,7 +2095,9 @@ mod diag_tests {
 
     #[test]
     fn detect_external_rekordbox_db_env_override_nonexistent() {
-        let _guard = env_var_lock().lock().expect("env var lock");
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Point to a path that doesn't exist — should return found: false
         unsafe {
             std::env::set_var(
@@ -2096,15 +2105,26 @@ mod diag_tests {
                 "/tmp/__nonexistent_external_rekordbox_db_test__",
             )
         };
+        let candidates = external_rekordbox_db_candidates();
         let result = detect_external_rekordbox_db();
         unsafe { std::env::remove_var("DJUSBTKIT_REKORDBOX_DB_PATH") };
-        assert!(!result.found);
-        assert!(result.path.is_none());
+        // A missing override is never reported. Detection still falls back to
+        // the standard install paths, which may hold a real rekordbox library on
+        // a dev machine, so judge the override on its own.
+        assert_ne!(
+            result.path.as_deref(),
+            Some("/tmp/__nonexistent_external_rekordbox_db_test__")
+        );
+        let override_only = first_existing_rekordbox_db(&candidates[..1]);
+        assert!(!override_only.found);
+        assert!(override_only.path.is_none());
     }
 
     #[test]
     fn detect_external_rekordbox_db_env_override_existing_file() {
-        let _guard = env_var_lock().lock().expect("env var lock");
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = std::env::temp_dir().join("__test_external_master.db");
         std::fs::write(&tmp, b"fake").unwrap();
         unsafe { std::env::set_var("DJUSBTKIT_REKORDBOX_DB_PATH", tmp.to_str().unwrap()) };
@@ -2117,7 +2137,9 @@ mod diag_tests {
 
     #[test]
     fn external_rekordbox_db_candidates_includes_env_override() {
-        let _guard = env_var_lock().lock().expect("env var lock");
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("DJUSBTKIT_REKORDBOX_DB_PATH", "/custom/path/master.db") };
         let candidates = external_rekordbox_db_candidates();
         unsafe { std::env::remove_var("DJUSBTKIT_REKORDBOX_DB_PATH") };
@@ -2131,7 +2153,9 @@ mod diag_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn external_rekordbox_db_candidates_includes_wineprefix() {
-        let _guard = env_var_lock().lock().expect("env var lock");
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefix = tempfile::tempdir().expect("prefix");
         std::fs::create_dir_all(prefix.path().join("drive_c/users/dj")).expect("user dir");
         unsafe { std::env::set_var("WINEPREFIX", prefix.path()) };
@@ -2145,7 +2169,9 @@ mod diag_tests {
 
     #[test]
     fn external_rekordbox_db_candidates_honours_legacy_env_override() {
-        let _guard = env_var_lock().lock().expect("env var lock");
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var("DJUSBTKIT_MASTER_DB_PATH", "/legacy/path/master.db") };
         let candidates = external_rekordbox_db_candidates();
         unsafe { std::env::remove_var("DJUSBTKIT_MASTER_DB_PATH") };
@@ -2158,7 +2184,9 @@ mod diag_tests {
 
     #[test]
     fn external_rekordbox_db_candidates_includes_macos_library_pioneer_path() {
-        let _guard = env_var_lock().lock().expect("env var lock");
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = std::env::var("HOME").expect("HOME must be set for this test");
         let candidates = external_rekordbox_db_candidates();
         let expected = PathBuf::from(home).join("Library/Pioneer/rekordbox/master.db");

@@ -3344,7 +3344,11 @@ fn scan_library_rescan_preserves_existing_key_when_scanner_has_no_tonality() {
 #[test]
 fn adding_usb_track_clears_stale_local_key_when_usb_key_is_missing() {
     let root = tempdir().expect("temp root");
-    let usb = root.path().join("usb");
+    // The seeded local row must carry the path the backend resolves USB files
+    // to, which is canonical (macOS tempdirs sit behind `/var` -> `/private/var`).
+    let usb = fs::canonicalize(root.path())
+        .expect("canonical temp root")
+        .join("usb");
     fs::create_dir_all(&usb).expect("create usb");
 
     let data_dir = root.path().join("data");

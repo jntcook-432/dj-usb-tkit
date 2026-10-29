@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use super::super::SETTING_EXPORT_OWNED_FILES_PREFIX;
 use super::super::usb_helpers::sanitize_text;
-use super::super::usb_utils::{canonicalize_playlist_name, resolve_usb_side_path};
+use super::super::usb_utils::{
+    canonicalize_or_self, canonicalize_playlist_name, resolve_usb_side_path,
+};
 use super::super::usb_vendor_compat::{
     USB_ANALYSIS_PREFIX, USB_ARTWORK_DIR, USB_ARTWORK_PREFIX, USB_CONTENTS_PREFIX,
     USB_VENDOR_ROOT_DIR,
@@ -620,7 +622,22 @@ pub fn usb_relative_path(usb_root: &Path, path: &Path) -> Option<String> {
         joined = usb_root.join(path);
         &joined
     };
-    let rel = abs.strip_prefix(usb_root).ok()?;
+    // `resolve_usb_side_path` hands back canonical paths, so a root reached
+    // through a symlink (macOS `/var` -> `/private/var`, a symlinked mount)
+    // would never prefix-match. Compare canonical forms when the plain one fails.
+    let rel = match abs.strip_prefix(usb_root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => {
+            let canon_root = canonicalize_or_self(usb_root.to_path_buf());
+            match abs.strip_prefix(&canon_root) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => canonicalize_or_self(abs.to_path_buf())
+                    .strip_prefix(&canon_root)
+                    .ok()?
+                    .to_path_buf(),
+            }
+        }
+    };
     Some(format!("/{}", rel.to_string_lossy().replace('\\', "/")))
 }
 

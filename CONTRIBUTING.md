@@ -94,6 +94,12 @@ Run the frontend tests from `vanilla-ui/`:
 npm test
 ```
 
+To run the whole Rust workspace (`cargo test --workspace` from the repo root), build the frontend first: the desktop crate's `tauri::generate_context!()` embeds `frontendDist` (`vanilla-ui/dist`) at compile time and fails to compile without it.
+
+```text
+cd vanilla-ui && npm ci && npm run build
+```
+
 If your change affects only one area, it is fine to mention exactly which tests you ran.
 
 ### Rust Coverage
